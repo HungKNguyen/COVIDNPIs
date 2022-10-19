@@ -1,0 +1,468 @@
+---
+title: "ECON481_HungNguyen_Project"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE)
+library(miceadds)
+library(timetk)
+library(plm)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(latex2exp)
+library(stargazer)
+library(coefplot)
+library(tidyverse)
+theme_set(theme_bw())
+reproduction_raw <- read_csv("https://raw.githubusercontent.com/crondonm/TrackingR/main/Estimates-Database/database.csv")
+panel_raw <- read_csv("https://raw.githubusercontent.com/OxCGRT/covid-policy-tracker/master/data/OxCGRT_latest.csv")
+confirmed_case_raw <- read_csv("https://raw.githubusercontent.com/OxCGRT/covid-policy-tracker/master/data/timeseries/confirmed_cases.csv")
+```
+
+```{r bts_milestone}
+# Transform confirmed case to get first day with 1000 cases
+confirmed_case <- confirmed_case_raw %>% dplyr::select(-c(`...1`, country_code)) %>%
+  pivot_longer(!country_name, names_to = "Date", values_to = "ConfirmCase") %>%
+  mutate(Date = as.Date(Date, "%d%b%Y")) %>%
+  pivot_wider(names_from = country_name, values_from = ConfirmCase)
+
+get_milestone <- function(v) {
+  l <- unlist(lapply(v, function(x) {
+    to_return <- confirmed_case$Date[detect_index(confirmed_case[[x]], function(x) {
+      ifelse(is.na(x), FALSE, x >= 1000)
+      })]
+    ifelse(is.null(to_return), NA, to_return)
+  }))
+}
+
+milestone <- as_tibble(data.frame(country_name = colnames(confirmed_case)[-1])) 
+milestone <- milestone %>% mutate(date = as_date(get_milestone(milestone$country_name)),
+         week = week(date))
+```
+
+```{r bts_included_country}
+include <- milestone %>% filter(week %in% c(12,13,14))
+country_filter <- include$country_name
+```
+
+```{r bts_included_time}
+# Week 15 2020-04-08 to 2021-10-20, due to data availability
+time_filter <- seq(from = as.Date("2020-04-08"), to = as.Date("2021-10-20"), by = 7)
+# Lag 10, week 5 2020-01-29, lag 10 in total is needed for all of the calculation
+time_filter_extend <- seq(from = as.Date("2020-01-29"), to = as.Date("2021-10-20"), by = 7)
+```
+
+```{r, bts_reproduction_rate}
+reproduction_rate <- reproduction_raw %>% filter(days_infectious == 5) %>%
+  select(c(`Country/Region`, Date, R)) %>%
+  rename(CountryName = `Country/Region`,
+         ReproductionRate = R)
+  
+reproduction_rate_diff <- reproduction_rate %>%
+  filter(Date %in% time_filter_extend) %>%
+  mutate(Date = as.Date(Date)) %>%
+  pivot_wider(names_from = CountryName, values_from = ReproductionRate) %>%
+  arrange(Date) %>%
+  mutate_at(vars(-Date), function(x) {x - dplyr::lag(x)}) %>%
+  pivot_longer(!Date, names_to = "CountryName") %>%
+  rename(ReproductionRate = value)
+```
+
+```{r bts_final_data}
+final_data <- panel_raw %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>%
+  dplyr::select(c(CountryName, Date, `C1_School closing`, `C2_Workplace closing`,
+                  `C3_Cancel public events`, `C4_Restrictions on gatherings`,
+                  `C5_Close public transport`, `C6_Stay at home requirements`,
+                  `C7_Restrictions on internal movement`, `C8_International travel controls`,
+                  `E1_Income support`, `E2_Debt/Contact relief`, `H1_Public information campaigns`, 
+                  `H2_Testing policy`, `H3_Contact tracing`, `H6_Facial Coverings`,
+                  `H8_Protection of elderly people`)) %>%
+  rename(SchoolClosing = `C1_School closing`,
+         WorkplaceClosing = `C2_Workplace closing`,
+         PublicEvents = `C3_Cancel public events`,
+         Gatherings = `C4_Restrictions on gatherings`,
+         PublicTransport = `C5_Close public transport`,
+         StayAtHome = `C6_Stay at home requirements`,
+         InternalMovement = `C7_Restrictions on internal movement`,
+         InternationalTravel = `C8_International travel controls`,
+         IncomeSupport = `E1_Income support`,
+         DebtRelief = `E2_Debt/Contact relief`,
+         PublicInfo = `H1_Public information campaigns`,
+         TestingAvailability = `H2_Testing policy`,
+         ContactTracing = `H3_Contact tracing`,
+         FacialCovering = `H6_Facial Coverings`,
+         EldersProtection = `H8_Protection of elderly people`) %>%
+  mutate(Date = as.Date(as.character(Date), "%Y%m%d")) %>%
+  filter(CountryName %in% country_filter) %>%
+  filter(Date %in% time_filter_extend) %>%
+  mutate(WorkplaceClosingIncomeSupport = WorkplaceClosing * IncomeSupport,
+         StayAtHomeIncomeSupport = StayAtHome * IncomeSupport,
+         GatheringsPublicInfo = Gatherings * PublicInfo,
+         StayAtHomePublicInfo = StayAtHome * PublicInfo,
+         FacialCoveringPublicInfo = FacialCovering * PublicInfo) %>%
+  pivot_wider(names_from = CountryName, values_from = SchoolClosing:FacialCoveringPublicInfo) %>%
+  arrange(Date) %>%
+  mutate_at(vars(-Date), function(x) {x - dplyr::lag(x)}) %>%
+  mutate_at(vars(-Date), dplyr::lag, n = 2) %>%
+  filter(Date %in% time_filter) %>%
+  pivot_longer(!Date, names_to = c("variable","CountryName"), names_sep = "_") %>%
+  pivot_wider(names_from = variable, values_from = value) %>%
+  mutate(Month = month(Date, label = TRUE, abbr = TRUE),
+         Year = year(Date)) %>%
+  unite(MonthYear, Month:Year) %>%
+  merge(reproduction_rate_diff)
+```
+
+```{r update_country_filter}
+missing_data <- final_data %>% filter(!complete.cases(.))
+new_country_filter <- country_filter[!country_filter %in% missing_data$CountryName]
+
+final_data <- final_data %>% filter(CountryName %in% new_country_filter)
+```
+
+```{r bts_naive_data}
+naive_data <- panel_raw %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>%
+  dplyr::select(c(CountryName, Date, `C1_School closing`, `C2_Workplace closing`,
+                  `C3_Cancel public events`, `C4_Restrictions on gatherings`,
+                  `C5_Close public transport`, `C6_Stay at home requirements`,
+                  `C7_Restrictions on internal movement`, `C8_International travel controls`,
+                  `E1_Income support`, `E2_Debt/Contact relief`, `H1_Public information campaigns`, 
+                  `H2_Testing policy`, `H3_Contact tracing`, `H6_Facial Coverings`,
+                  `H8_Protection of elderly people`,GovernmentResponseIndexForDisplay)) %>%
+  rename(SchoolClosing = `C1_School closing`,
+         WorkplaceClosing = `C2_Workplace closing`,
+         PublicEvents = `C3_Cancel public events`,
+         Gatherings = `C4_Restrictions on gatherings`,
+         PublicTransport = `C5_Close public transport`,
+         StayAtHome = `C6_Stay at home requirements`,
+         InternalMovement = `C7_Restrictions on internal movement`,
+         InternationalTravel = `C8_International travel controls`,
+         IncomeSupport = `E1_Income support`,
+         DebtRelief = `E2_Debt/Contact relief`,
+         PublicInfo = `H1_Public information campaigns`,
+         TestingAvailability = `H2_Testing policy`,
+         ContactTracing = `H3_Contact tracing`,
+         FacialCovering = `H6_Facial Coverings`,
+         EldersProtection = `H8_Protection of elderly people`,
+         Response = GovernmentResponseIndexForDisplay) %>%
+  mutate(Date = as.Date(as.character(Date), "%Y%m%d")) %>%
+  filter(CountryName %in% new_country_filter) %>%
+  filter(Date %in% time_filter_extend) %>%
+  pivot_wider(names_from = CountryName, values_from = SchoolClosing:Response) %>%
+  filter(Date %in% time_filter) %>%
+  pivot_longer(!Date, names_to = c("variable","CountryName"), names_sep = "_") %>%
+  pivot_wider(names_from = variable, values_from = value) %>%
+  merge(reproduction_rate)
+```
+
+```{r bts_gov_response}
+response <- panel_raw %>% 
+  filter(Jurisdiction == "NAT_TOTAL") %>%
+  dplyr::select(c(CountryName, Date, GovernmentResponseIndexForDisplay)) %>%
+  rename(Response = GovernmentResponseIndexForDisplay) %>%
+  mutate(Date = as.Date(as.character(Date), "%Y%m%d")) %>%
+  filter(CountryName %in% new_country_filter) %>%
+  filter(Date %in% time_filter_extend) %>%
+  pivot_wider(names_from = CountryName, values_from = Response) %>%
+  arrange(Date) %>%
+  mutate_at(vars(-Date), function(x) {x - dplyr::lag(x)}) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag1 = ~dplyr::lag(.x, n=1)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag2 = ~dplyr::lag(.x, n=2)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag3 = ~dplyr::lag(.x, n=3)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag4 = ~dplyr::lag(.x, n=4)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag5 = ~dplyr::lag(.x, n=5)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag6 = ~dplyr::lag(.x, n=6)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag7 = ~dplyr::lag(.x, n=7)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag8 = ~dplyr::lag(.x, n=8)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, -starts_with("Lag")), .fns = list(Lag9 = ~dplyr::lag(.x, n=9)), .names = "{fn}_{col}")) %>%
+  rename_at(vars(c(-Date, -starts_with("Lag"))), .funs = funs(paste0('Lag0_', .))) %>%
+  filter(Date %in% time_filter) %>%
+  pivot_longer(!Date, names_to = c("lag","CountryName"), names_sep = "_") %>%
+  pivot_wider(names_from = lag, values_from = value) %>%
+  merge(reproduction_rate_diff)
+```
+
+```{r bts_extend_data}
+extend_data <- panel_raw %>%
+  filter(Jurisdiction == "NAT_TOTAL") %>%
+  dplyr::select(c(CountryName, Date, `C1_School closing`, `C2_Workplace closing`,
+                  `C3_Cancel public events`, `C4_Restrictions on gatherings`,
+                  `C5_Close public transport`, `C6_Stay at home requirements`,
+                  `C7_Restrictions on internal movement`, `C8_International travel controls`,
+                  `E1_Income support`, `E2_Debt/Contact relief`, `H1_Public information campaigns`, 
+                  `H2_Testing policy`, `H3_Contact tracing`, `H6_Facial Coverings`,
+                  `H8_Protection of elderly people`)) %>%
+  rename(SchoolClosing = `C1_School closing`,
+         WorkplaceClosing = `C2_Workplace closing`,
+         PublicEvents = `C3_Cancel public events`,
+         Gatherings = `C4_Restrictions on gatherings`,
+         PublicTransport = `C5_Close public transport`,
+         StayAtHome = `C6_Stay at home requirements`,
+         InternalMovement = `C7_Restrictions on internal movement`,
+         InternationalTravel = `C8_International travel controls`,
+         IncomeSupport = `E1_Income support`,
+         DebtRelief = `E2_Debt/Contact relief`,
+         PublicInfo = `H1_Public information campaigns`,
+         TestingAvailability = `H2_Testing policy`,
+         ContactTracing = `H3_Contact tracing`,
+         FacialCovering = `H6_Facial Coverings`,
+         EldersProtection = `H8_Protection of elderly people`) %>%
+  mutate(Date = as.Date(as.character(Date), "%Y%m%d")) %>%
+  # Just so happen all 36 countries has delayed 9 weeks data
+  filter(CountryName %in% new_country_filter) %>%
+  filter(Date %in% time_filter_extend) %>%
+  pivot_wider(names_from = CountryName, values_from = SchoolClosing:EldersProtection) %>%
+  arrange(Date) %>%
+  mutate_at(vars(-Date), function(x) {x - dplyr::lag(x)}) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag1 = ~dplyr::lag(.x, n=1)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag2 = ~dplyr::lag(.x, n=2)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag3 = ~dplyr::lag(.x, n=3)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag4 = ~dplyr::lag(.x, n=4)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag5 = ~dplyr::lag(.x, n=5)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag6 = ~dplyr::lag(.x, n=6)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag7 = ~dplyr::lag(.x, n=7)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag8 = ~dplyr::lag(.x, n=8)), .names = "{fn}_{col}")) %>%
+  mutate(across(c(-Date, - starts_with("Lag")), .fns = list(Lag9 = ~dplyr::lag(.x, n=9)), .names = "{fn}_{col}")) %>%
+  filter(Date %in% time_filter) %>%
+  rename_at(vars(-Date, -starts_with("Lag")), .funs = funs(paste0('Lag0_', .))) %>%
+  pivot_longer(!Date, names_to = c("lag","variable","CountryName"), names_sep = "_") %>%
+  unite("Lag_Variable", lag:variable) %>%
+  pivot_wider(names_from = Lag_Variable, values_from = value) %>%
+  merge(reproduction_rate_diff)
+```
+
+```{r milestone_vis}
+ggplot(milestone, aes(x=week)) + 
+  geom_bar(fill="#69b3a2", color="#e9ecef") +
+  labs(title = "Figure 1: 1000 Cases Milestone", y = "Country Count", x = "Weeks since 01/01/2020")
+```
+
+```{r summary_stats, , results = "asis"}
+stargazer(as.data.frame(naive_data[3:19]), title = "Summary Statistic",
+          notes = "Data from 36 countries spanning 81 weekly periods")
+```
+
+```{r included_country_vis}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world <- world %>% mutate(included = admin %in% new_country_filter)
+ggplot(data = world) + geom_sf(aes(fill = included)) + 
+  scale_fill_manual(values = c("#CCCCCC", "#339900")) +
+  labs(title = "Figure 2: Countries included in the data", fill = "Included") + 
+  theme(legend.position="bottom")
+```
+
+```{r ptc_change_confirmed_vis}
+reproduction_ts <- reproduction_rate %>%
+  filter(Date %in% time_filter) %>%
+  filter(CountryName %in% new_country_filter) %>%
+  pivot_wider(names_from = CountryName, values_from = ReproductionRate)
+  
+reproduction_ts <- tk_xts(reproduction_ts, date_var = Date)
+
+plot(reproduction_ts, col = 1:20, ylab = "Reproduction Rate",
+     main = "Figure 3: Reproduction Rate over time")
+```
+
+```{r, naive_modeling}
+MNR <- lm(ReproductionRate~Response, data = naive_data)
+MNRTW <- plm(ReproductionRate~Response,data=naive_data, index=c("CountryName", "Date"), model = "within", effect="twoways")
+MNIS <- lm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection, data = naive_data)
+MNISTW <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection,data=naive_data, index=c("CountryName", "Date"), model = "within", effect="twoways")
+```
+
+```{r, Naive_Result, results = "asis"}
+stargazer(MNR, MNRTW, MNIS, MNISTW,
+          title = "OLS and FE Estimators",
+          report=('vc*s'),
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes.append = FALSE,
+          model.numbers = FALSE, 
+          column.labels = c("(1)","(2)", "(3)", "(4)"),
+          font.size = "tiny")
+```
+
+```{r, modeling_lag}
+MLA <- plm(ReproductionRate~Lag0 + Lag1 + Lag2 + Lag3 + Lag4 + Lag5 + Lag6 + Lag7 + Lag8 + Lag9, data=response, index=c("Date"), model = "within", effect="time")
+```
+
+```{r, vis_lag}
+coefplot(MLA, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 4: Relationship between Reproduction Rate and \nGovernment Response over different lags")
+```
+
+```{r modeling}
+MFD <- lm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection, data=final_data)
+
+MFDFE <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MFDFEMY <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection, data=final_data, index=c("MonthYear"), model = "within", effect="time")
+```
+
+```{r, Result, results = "asis"}
+stargazer(MFD, MFDFE, MFDFEMY,
+          title = "Lagged FD Estimators",
+          report=('vc*s'),
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes.append = FALSE,
+          model.numbers = FALSE, 
+          column.labels = c("(5)","(6)", "(7)"),
+          font.size = "tiny")
+```
+
+```{r modeling_interaction}
+MI0 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MI1 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection + WorkplaceClosingIncomeSupport, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MI2 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection + StayAtHomeIncomeSupport, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MI3 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection + GatheringsPublicInfo, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MI4 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection + StayAtHomePublicInfo, data=final_data, index=c("Date"), model = "within", effect="time")
+
+MI5 <- plm(ReproductionRate~SchoolClosing + WorkplaceClosing + PublicEvents + Gatherings + PublicTransport + StayAtHome + InternalMovement + InternationalTravel + IncomeSupport + DebtRelief + PublicInfo + TestingAvailability + ContactTracing + FacialCovering + EldersProtection + FacialCoveringPublicInfo, data=final_data, index=c("Date"), model = "within", effect="time")
+```
+
+```{r, Results Interaction, results= "asis"}
+stargazer(MI0, MI1, MI2, MI3, MI4, MI5,
+          title = "Exploration of interaction effects",
+          report=('vc*s'),
+          keep.stat = c("n","rsq","adj.rsq"),
+          notes.append = FALSE,
+          model.numbers = FALSE, 
+          column.labels = c("(8)","(9)", "(10)", "(11)", "(12)", "(13)"),
+          font.size = "tiny")
+```
+
+```{r, modeling_extend_lag}
+MFDFEDL <- lm.cluster(ReproductionRate~ Date + 
+                 Lag0_SchoolClosing + Lag1_SchoolClosing + Lag2_SchoolClosing + Lag3_SchoolClosing + Lag4_SchoolClosing + Lag5_SchoolClosing + Lag6_SchoolClosing + Lag7_SchoolClosing + Lag8_SchoolClosing + Lag9_SchoolClosing +
+                 Lag0_WorkplaceClosing + Lag1_WorkplaceClosing + Lag2_WorkplaceClosing + Lag3_WorkplaceClosing + Lag4_WorkplaceClosing + Lag5_WorkplaceClosing + Lag6_WorkplaceClosing + Lag7_WorkplaceClosing + Lag8_WorkplaceClosing + Lag9_WorkplaceClosing +
+                 Lag0_PublicEvents + Lag1_PublicEvents + Lag2_PublicEvents + Lag3_PublicEvents + Lag4_PublicEvents + Lag5_PublicEvents + Lag6_PublicEvents + Lag7_PublicEvents + Lag8_PublicEvents + Lag9_PublicEvents +
+                 Lag0_Gatherings + Lag1_Gatherings + Lag2_Gatherings + Lag3_Gatherings + Lag4_Gatherings + Lag5_Gatherings + Lag6_Gatherings + Lag7_Gatherings + Lag8_Gatherings + Lag9_Gatherings +
+                 Lag0_PublicTransport + Lag1_PublicTransport + Lag2_PublicTransport + Lag3_PublicTransport + Lag4_PublicTransport + Lag5_PublicTransport + Lag6_PublicTransport + Lag7_PublicTransport + Lag8_PublicTransport + Lag9_PublicTransport +
+                 Lag0_StayAtHome + Lag1_StayAtHome + Lag2_StayAtHome + Lag3_StayAtHome + Lag4_StayAtHome + Lag5_StayAtHome + Lag6_StayAtHome + Lag7_StayAtHome + Lag8_StayAtHome + Lag9_StayAtHome +
+                 Lag0_InternalMovement + Lag1_InternalMovement + Lag2_InternalMovement + Lag3_InternalMovement + Lag4_InternalMovement + Lag5_InternalMovement + Lag6_InternalMovement + Lag7_InternalMovement + Lag8_InternalMovement + Lag9_InternalMovement +
+                 Lag0_InternationalTravel + Lag1_InternationalTravel + Lag2_InternationalTravel + Lag3_InternationalTravel + Lag4_InternationalTravel + Lag5_InternationalTravel + Lag6_InternationalTravel + Lag7_InternationalTravel + Lag8_InternationalTravel + Lag9_InternationalTravel +
+                 Lag0_IncomeSupport + Lag1_IncomeSupport + Lag2_IncomeSupport + Lag3_IncomeSupport + Lag4_IncomeSupport + Lag5_IncomeSupport + Lag6_IncomeSupport + Lag7_IncomeSupport + Lag8_IncomeSupport + Lag9_IncomeSupport +
+                 Lag0_DebtRelief + Lag1_DebtRelief + Lag2_DebtRelief + Lag3_DebtRelief + Lag4_DebtRelief + Lag5_DebtRelief + Lag6_DebtRelief + Lag7_DebtRelief + Lag8_DebtRelief + Lag9_DebtRelief +
+                 Lag0_PublicInfo + Lag1_PublicInfo + Lag2_PublicInfo + Lag3_PublicInfo + Lag4_PublicInfo + Lag5_PublicInfo + Lag6_PublicInfo + Lag7_PublicInfo + Lag8_PublicInfo + Lag9_PublicInfo +
+                  Lag0_TestingAvailability + Lag1_TestingAvailability + Lag2_TestingAvailability + Lag3_TestingAvailability + Lag4_TestingAvailability + Lag5_TestingAvailability + Lag6_TestingAvailability + Lag7_TestingAvailability + Lag8_TestingAvailability + Lag9_TestingAvailability +
+                 Lag0_ContactTracing + Lag1_ContactTracing + Lag2_ContactTracing + Lag3_ContactTracing + Lag4_ContactTracing + Lag5_ContactTracing + Lag6_ContactTracing + Lag7_ContactTracing + Lag8_ContactTracing + Lag9_ContactTracing +
+                  Lag0_FacialCovering + Lag1_FacialCovering + Lag2_FacialCovering + Lag3_FacialCovering + Lag4_FacialCovering + Lag5_FacialCovering + Lag6_FacialCovering + Lag7_FacialCovering + Lag8_FacialCovering + Lag9_FacialCovering +
+                 Lag0_EldersProtection + Lag1_EldersProtection + Lag2_EldersProtection + Lag3_EldersProtection + Lag4_EldersProtection + Lag5_EldersProtection + Lag6_EldersProtection + Lag7_EldersProtection + Lag8_EldersProtection + Lag9_EldersProtection,
+               cluster = 'Date', data=extend_data)
+```
+
+```{r, schoolclosing_lag}
+coefs <- sprintf("Lag%d_SchoolClosing",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 5: Relationship between Reproduction Rate and \nSchool Closing over different lags",
+         predictors = coefs)
+```
+
+```{r, workplaceclosing_lag}
+coefs <- sprintf("Lag%d_WorkplaceClosing",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 6: Relationship between Reproduction Rate and \nWorkplace Closing over different lags",
+         predictors = coefs)
+```
+
+```{r, publicevent_lag}
+coefs <- sprintf("Lag%d_PublicEvents",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 7: Relationship between Reproduction Rate and \nPublic Events over different lags",
+         predictors = coefs)
+```
+
+```{r, gatherings_lag}
+coefs <- sprintf("Lag%d_Gatherings",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 8: Relationship between Reproduction Rate and \nGatherings over different lags",
+         predictors = coefs)
+```
+
+```{r, publictransport_lag}
+coefs <- sprintf("Lag%d_PublicTransport",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 9: Relationship between Reproduction Rate and \nPublic Transport over different lags",
+         predictors = coefs)
+```
+
+```{r, stayathome_lag}
+coefs <- sprintf("Lag%d_StayAtHome",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 10: Relationship between Reproduction Rate and \nStay At Home over different lags",
+         predictors = coefs)
+```
+
+```{r, internalmovement_lag}
+coefs <- sprintf("Lag%d_InternalMovement",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 11: Relationship between Reproduction Rate and \nInternal Movement over different lags",
+         predictors = coefs)
+```
+
+```{r, internationaltravel_lag}
+coefs <- sprintf("Lag%d_InternationalTravel",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 12: Relationship between Reproduction Rate and \nInternational Travel over different lags",
+         predictors = coefs)
+```
+
+```{r, incomesupport_lag}
+coefs <- sprintf("Lag%d_IncomeSupport",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 13: Relationship between Reproduction Rate and \nIncome Support over different lags",
+         predictors = coefs)
+```
+
+```{r, debtrelief_lag}
+coefs <- sprintf("Lag%d_DebtRelief",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 14: Relationship between Reproduction Rate and \nDebt Relief over different lags",
+         predictors = coefs)
+```
+
+```{r, publicinfo_lag}
+coefs <- sprintf("Lag%d_PublicInfo",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 15: Relationship between Reproduction Rate and \nPublic Info over different lags",
+         predictors = coefs)
+```
+
+```{r, testingAvailability_lag}
+coefs <- sprintf("Lag%d_TestingAvailability",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 16: Relationship between Reproduction Rate and \nTesting Availability over different lags",
+         predictors = coefs)
+```
+
+```{r, Contacttracing_lag}
+coefs <- sprintf("Lag%d_ContactTracing",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 17: Relationship between Reproduction Rate and \nContact Tracing over different lags",
+         predictors = coefs)
+```
+
+```{r, facialcovering_lag}
+coefs <- sprintf("Lag%d_FacialCovering",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 18: Relationship between Reproduction Rate and \nFacial Covering over different lags",
+         predictors = coefs)
+```
+
+```{r, eldersprotection_lag}
+coefs <- sprintf("Lag%d_EldersProtection",seq(0,9))
+coefplot(MFDFEDL$lm_res, horizontal = TRUE, numberAngle = 30,
+         title = "Figure 19: Relationship between Reproduction Rate and \nElders Protection over different lags",
+         predictors = coefs)
+```
+
+
